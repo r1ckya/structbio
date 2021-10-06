@@ -10,6 +10,7 @@ from Bio.PDB.PDBParser import PDBParser
 from Bio.SeqUtils import seq1
 from scipy.spatial.transform import Rotation as R
 
+# atom bond distances
 DIST = dict(CN=1.32, NCA=1.47, CAC=1.53)
 EPS = 1e-9
 
@@ -19,6 +20,10 @@ def normalize(v):
 
 
 def rmsd(chain, anchor):
+    """
+    Calculates RMSD v.r.t. anchor
+    """
+
     assert len(chain) >= 3 and len(anchor) == 3
     mse = 0
     for a, b in zip(chain[-3:], anchor):
@@ -28,17 +33,29 @@ def rmsd(chain, anchor):
 
 
 def rotation_axis(N, Ca):
+    """
+    Finds line (N, Ca) equation coefficients
+    """
     return dict(xyz=N, abc=Ca - N)
 
 
 def central_point(axis, N, Ca, M):
+    """
+    Projects point M onto axis, finds central point of rotation
+    """
+
     v = N - Ca
     t = (np.dot(v, M) - np.dot(v, axis["xyz"])) / np.dot(v, axis["abc"])
     return axis["xyz"] + axis["abc"] * t
 
 
 def rotate(M, O, alpha, theta):
+    """
+    3D Rotation of point M by angle aplha, thata - axis unit vector
+    """
+
     v = M - O
+    # skip point on the axis
     if np.linalg.norm(v) < EPS:
         return O
     v_norm = np.linalg.norm(v)
@@ -66,8 +83,9 @@ def ccd(chain, anchor, tol=0.08, max_iter=1000):
 
         n_iter += 1
 
+        # for each bond rotate next points around the bond
         for i in range(len(chain) - 2):
-            # skip peptide bond, angle \theta = \pi
+            # skip peptide bond, angle theta = pi
             if chain[i].name == "C" and chain[i + 1].name == "N":
                 continue
 
@@ -80,6 +98,7 @@ def ccd(chain, anchor, tol=0.08, max_iter=1000):
 
             b, c = 0.0, 0.0
 
+            # for each anchor point calculate b, c coefficients
             for j in range(1, 4):
                 M = chain[-j].coord
                 F = anchor[-j].coord
@@ -90,31 +109,42 @@ def ccd(chain, anchor, tol=0.08, max_iter=1000):
                 f = F - O
                 r_norm = np.linalg.norm(r)
 
+                # skip points on the axis
                 if r_norm < EPS:
                     continue
 
+                # thata, r_cap, s_cap - unit basis vectors
                 r_cap = r / r_norm
                 s_cap = np.cross(r_cap, theta)
 
                 b += 2 * r_norm * np.dot(f, r_cap)
                 c += 2 * r_norm * np.dot(f, s_cap)
 
+            # find rotation angle
             x = b / np.sqrt(b ** 2 + c ** 2)
             y = c / np.sqrt(b ** 2 + c ** 2)
-
             alpha = np.arctan2(y, x)
 
+            # rotate next points
             for j in range(i + 2, len(chain)):
                 O = central_point(axis, N, Ca, chain[j].coord)
                 chain[j].set_coord(rotate(chain[j].coord, O, alpha, theta))
 
 
 def random_rotation(v):
+    """
+    Rotates vector v by random euler angles in range [-1, 1] radians
+    """
+
     rot = R.from_euler("xyz", [np.random.uniform(-1, 1) for _ in range(3)])
     return rot.apply(v)
 
 
 def init_chain(res, hole_begin, hole_len):
+    """
+    Initializes moving chain with random angles and fixed distances
+    """
+
     last_res = res[hole_begin - 1]
 
     v_unit = normalize(last_res["C"].coord - last_res["CA"].coord)
@@ -123,17 +153,20 @@ def init_chain(res, hole_begin, hole_len):
     coords = last_res["C"].coord.copy()
 
     for _ in range(hole_len + 1):
+        # do not rotate CN bond
         coords += v_unit * DIST["CN"]
         moving_chain.append(
             Atom("N", coords.copy(), 0, 0, "", "N", None, element="N")
         )
 
+        # randomly rotate bond
         v_unit = random_rotation(v_unit)
         coords += v_unit * DIST["NCA"]
         moving_chain.append(
             Atom("CA", coords.copy(), 0, 0, "", "CA", None, element="C")
         )
 
+        # randomly rotate bond
         v_unit = random_rotation(v_unit)
         coords += v_unit * DIST["CAC"]
         moving_chain.append(
@@ -149,10 +182,13 @@ def init_chain(res, hole_begin, hole_len):
 
 
 def main():
+    np.random.seed(123)
+
     parser = PDBParser()
     structure = parser.get_structure("unk", "hw_1_hole.pdb")
     chain = structure[0]["Z"]
 
+    # Find the hole
     res = Selection.unfold_entities(chain, "R")
     seq_w_hole = "".join(seq1(r.resname) for r in res)
     seq = next(SeqIO.parse("PD1.fasta", "fasta")).seq
@@ -171,6 +207,7 @@ def main():
     n_succ = 0
     total_err = 0
 
+    coords_file = open("coords.txt", "w")
     for trial in range(n_trials):
         moving_chain, anchor = init_chain(res, hole_begin, hole_len)
         converged, chain, err, n_iter = ccd(
@@ -178,7 +215,16 @@ def main():
         )
         n_succ += converged
         total_err += err
-        print(f"trial {trial}, n_iter {n_iter}, err {err}", file=sys.stderr)
+        print(f"Trial {trial}, n_iter {n_iter}, err {err}", file=sys.stderr)
+
+        if converged:
+            print(f"Trial {trial} successful, atoms coords:", file=coords_file)
+            for i, atom in enumerate(chain, 2):
+                print(atom.name, np.around(atom.coord, 3), file=coords_file)
+                if i % 3 == 0:
+                    print(file=coords_file)
+
+    coords_file.close()
 
     p_succ = np.round(n_succ / n_trials, 3)
     mean_err = np.round(total_err / n_trials, 3)
